@@ -7,8 +7,12 @@ import type { ModelThinkingLevel, StreamOptions, ThinkingBudgets } from "opencla
 /** How Bedrock thinking output should be displayed to users. */
 type BedrockThinkingDisplay = "summarized" | "omitted";
 
+/** Plugin-internal guardrail mode propagated from registration to the stream runtime. */
+export const BEDROCK_GUARDRAIL_STREAM_MODE = Symbol("bedrockGuardrailStreamMode");
+
 /** Extra Bedrock-specific stream options accepted by the provider runtime. */
 export interface BedrockOptions extends StreamOptions {
+  [BEDROCK_GUARDRAIL_STREAM_MODE]?: "sync" | "async";
   region?: string;
   profile?: string;
   toolChoice?: "auto" | "any" | "none" | { type: "tool"; name: string };

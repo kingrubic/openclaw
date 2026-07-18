@@ -21,7 +21,7 @@ import {
 } from "openclaw/plugin-sdk/provider-model-shared";
 import { streamWithPayloadPatch } from "openclaw/plugin-sdk/provider-stream-shared";
 import { refreshAwsSharedConfigCacheForBedrock } from "./aws-credential-refresh.js";
-import { supportsBedrockPromptCaching } from "./bedrock-options.js";
+import { BEDROCK_GUARDRAIL_STREAM_MODE, supportsBedrockPromptCaching } from "./bedrock-options.js";
 import { loadBedrockControlPlaneSdk, runBedrockControlPlaneRequest } from "./control-plane.js";
 import { mergeImplicitBedrockProvider, resolveBedrockConfigApiKey } from "./discovery-shared.js";
 import { bedrockMemoryEmbeddingProviderAdapter } from "./memory-embedding-adapter.js";
@@ -156,7 +156,11 @@ function createGuardrailWrapStreamFn(
       return inner;
     }
     return (model, context, options) => {
-      return streamWithPayloadPatch(inner, model, context, options, (payload) => {
+      const guardrailOptions = {
+        ...options,
+        [BEDROCK_GUARDRAIL_STREAM_MODE]: guardrailConfig.streamProcessingMode ?? "sync",
+      };
+      return streamWithPayloadPatch(inner, model, context, guardrailOptions, (payload) => {
         const gc: Record<string, unknown> = {
           guardrailIdentifier: guardrailConfig.guardrailIdentifier,
           guardrailVersion: guardrailConfig.guardrailVersion,

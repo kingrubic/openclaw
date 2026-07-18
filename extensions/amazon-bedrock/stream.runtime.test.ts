@@ -6,8 +6,19 @@ import {
 } from "@aws-sdk/client-bedrock-runtime";
 import { onLlmRequestActivity } from "openclaw/plugin-sdk/provider-stream-shared";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { BEDROCK_GUARDRAIL_STREAM_MODE } from "./bedrock-options.js";
 import { streamBedrock, streamSimpleBedrock } from "./stream.runtime.js";
 import { streamTesting as testing } from "./test-support.js";
+
+const { warnMock } = vi.hoisted(() => ({ warnMock: vi.fn() }));
+
+vi.mock("openclaw/plugin-sdk/core", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("openclaw/plugin-sdk/core")>();
+  return {
+    ...actual,
+    createSubsystemLogger: () => ({ warn: warnMock }),
+  };
+});
 
 function bedrockModel(overrides: Record<string, unknown>) {
   return {
@@ -77,6 +88,7 @@ async function captureClientRegion(
 afterEach(() => {
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
+  warnMock.mockClear();
 });
 
 describe("Bedrock tool-result replay", () => {
@@ -273,10 +285,135 @@ describe("Bedrock profile endpoint resolution", () => {
   );
 });
 
+describe("Bedrock guardrail diagnostics", () => {
+  it("summarizes trace metadata without exposing guardrail content", () => {
+    const sensitive = {
+      actionReason: "blocked because customer-secret appeared",
+      modelOutput: ["private blocked response"],
+      inputAssessment: { "private-input-key": {} },
+      outputAssessments: { "private-output-key": [{}, {}] },
+    };
+
+    const summary = testing.summarizeGuardrailTrace({ trace: { guardrail: sensitive } });
+
+    expect(summary).toEqual({
+      tracePresent: true,
+      actionReasonPresent: true,
+      modelOutputCount: 1,
+      inputAssessmentCount: 1,
+      outputAssessmentCount: 2,
+    });
+    expect(JSON.stringify(summary)).not.toContain("customer-secret");
+    expect(JSON.stringify(summary)).not.toContain("private-");
+  });
+
+  it("omits diagnostics when guardrail trace is absent", () => {
+    expect(testing.summarizeGuardrailTrace({ usage: { totalTokens: 0 } })).toBeUndefined();
+  });
+});
+
 describe("Bedrock stop reasons", () => {
+  it("returns configured guardrail blocked text as the assistant response", async () => {
+    vi.spyOn(BedrockRuntimeClient.prototype, "send").mockResolvedValue({
+      $metadata: { httpStatusCode: 200 },
+      stream: streamEvents([
+        { messageStart: { role: ConversationRole.ASSISTANT } },
+        { contentBlockStart: { contentBlockIndex: 0, start: {} } },
+        {
+          contentBlockDelta: {
+            contentBlockIndex: 0,
+            delta: { text: "Request blocked by policy." },
+          },
+        },
+        { contentBlockStop: { contentBlockIndex: 0 } },
+        { messageStop: { stopReason: BedrockStopReason.GUARDRAIL_INTERVENED } },
+        {
+          metadata: {
+            trace: {
+              guardrail: {
+                actionReason: "blocked by policy",
+                modelOutput: ["Request blocked by policy."],
+                inputAssessment: { policy: {} },
+              },
+            },
+          },
+        },
+      ]),
+    } as never);
+
+    const result = await streamBedrock(bedrockModel({}), {
+      messages: [{ role: "user", content: "blocked input", timestamp: 0 }],
+    } as never).result();
+
+    expect(result.stopReason).toBe("stop");
+    expect(result.errorMessage).toBeUndefined();
+    expect(result.content).toEqual([{ type: "text", text: "Request blocked by policy." }]);
+    expect(warnMock).toHaveBeenCalledOnce();
+    expect(warnMock).toHaveBeenCalledWith("Bedrock guardrail intervened", {
+      tracePresent: true,
+      actionReasonPresent: true,
+      modelOutputCount: 1,
+      inputAssessmentCount: 1,
+      outputAssessmentCount: 0,
+    });
+    expect(JSON.stringify(warnMock.mock.calls)).not.toContain("blocked by policy");
+    expect(JSON.stringify(warnMock.mock.calls)).not.toContain("Request blocked by policy.");
+  });
+
+  it("reports a guardrail intervention without configured blocked text as an error", async () => {
+    vi.spyOn(BedrockRuntimeClient.prototype, "send").mockResolvedValue({
+      $metadata: { httpStatusCode: 200 },
+      stream: streamEvents([
+        { messageStart: { role: ConversationRole.ASSISTANT } },
+        { messageStop: { stopReason: BedrockStopReason.GUARDRAIL_INTERVENED } },
+      ]),
+    } as never);
+
+    const result = await streamBedrock(bedrockModel({}), {
+      messages: [{ role: "user", content: "blocked input", timestamp: 0 }],
+    } as never).result();
+
+    expect(result.stopReason).toBe("error");
+    expect(result.errorMessage).toBe(BedrockStopReason.GUARDRAIL_INTERVENED);
+  });
+
+  it("discards partial output when an async guardrail intervenes", async () => {
+    vi.spyOn(BedrockRuntimeClient.prototype, "send").mockResolvedValue({
+      $metadata: { httpStatusCode: 200 },
+      stream: streamEvents([
+        { messageStart: { role: ConversationRole.ASSISTANT } },
+        { contentBlockStart: { contentBlockIndex: 0, start: {} } },
+        {
+          contentBlockDelta: {
+            contentBlockIndex: 0,
+            delta: { text: "unsafe partial output" },
+          },
+        },
+        { contentBlockStop: { contentBlockIndex: 0 } },
+        { messageStop: { stopReason: BedrockStopReason.GUARDRAIL_INTERVENED } },
+      ]),
+    } as never);
+
+    const stream = streamBedrock(
+      bedrockModel({}),
+      { messages: [{ role: "user", content: "blocked input", timestamp: 0 }] } as never,
+      { [BEDROCK_GUARDRAIL_STREAM_MODE]: "async" },
+    );
+    const events = [];
+    for await (const event of stream) {
+      events.push(event);
+    }
+    const result = await stream.result();
+
+    expect(events.map((event) => event.type)).toEqual(["error"]);
+    expect(JSON.stringify(events)).not.toContain("unsafe partial output");
+    expect(result.content).toEqual([]);
+    expect(result.stopReason).toBe("error");
+    expect(result.errorMessage).toBe(BedrockStopReason.GUARDRAIL_INTERVENED);
+  });
+
   it.each([
     BedrockStopReason.CONTENT_FILTERED,
-    BedrockStopReason.GUARDRAIL_INTERVENED,
     BedrockStopReason.MALFORMED_MODEL_OUTPUT,
     BedrockStopReason.MALFORMED_TOOL_USE,
   ])("reports the provider stop reason %s", async (stopReason) => {

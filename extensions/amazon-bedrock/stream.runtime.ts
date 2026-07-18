@@ -27,6 +27,7 @@ import {
 } from "@aws-sdk/client-bedrock-runtime";
 import { NodeHttpHandler } from "@smithy/node-http-handler";
 import type { DocumentType } from "@smithy/types";
+import { createSubsystemLogger } from "openclaw/plugin-sdk/core";
 import { expectDefined } from "openclaw/plugin-sdk/expect-runtime";
 import {
   adjustMaxTokensForThinking,
@@ -69,11 +70,24 @@ import {
   notifyLlmRequestActivity,
 } from "openclaw/plugin-sdk/provider-stream-shared";
 import { describeToolResultMediaPlaceholder } from "openclaw/plugin-sdk/provider-transport-runtime";
-import { supportsBedrockPromptCaching, type BedrockOptions } from "./bedrock-options.js";
+import {
+  BEDROCK_GUARDRAIL_STREAM_MODE,
+  supportsBedrockPromptCaching,
+  type BedrockOptions,
+} from "./bedrock-options.js";
 import { supportsBedrockNativeMaxEffort } from "./thinking-policy.js";
+
+const log = createSubsystemLogger("amazon-bedrock");
 
 type Block = (TextContent | ThinkingContent | ToolCall) & { index?: number; partialJson?: string };
 type BedrockEventSink = { push(event: AssistantMessageEvent): void };
+type GuardrailTraceSummary = {
+  tracePresent: boolean;
+  actionReasonPresent: boolean;
+  modelOutputCount: number;
+  inputAssessmentCount: number;
+  outputAssessmentCount: number;
+};
 
 function usesClaudeFable5BedrockContract(model: Model<"bedrock-converse-stream">): boolean {
   return resolveClaudeFable5ModelIdentity(model) !== undefined;
@@ -155,12 +169,14 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
     const fable5 = usesClaudeFable5BedrockContract(model);
     // Claude classifiers may refuse after partial output. Hold every event until
     // messageStop proves the response is safe to expose.
-    const refusalBuffer = usesClaudeStreamingRefusalBedrockContract(model)
-      ? createDeferredEventBuffer<AssistantMessageEvent>(stream, () =>
-          notifyLlmRequestActivity(options.signal),
-        )
-      : undefined;
-    const eventSink = refusalBuffer ?? stream;
+    const guardrailStreamMode = options[BEDROCK_GUARDRAIL_STREAM_MODE];
+    const deferredBuffer =
+      usesClaudeStreamingRefusalBedrockContract(model) || guardrailStreamMode === "async"
+        ? createDeferredEventBuffer<AssistantMessageEvent>(stream, () =>
+            notifyLlmRequestActivity(options.signal),
+          )
+        : undefined;
+    const eventSink = deferredBuffer ?? stream;
 
     const config: BedrockRuntimeClientConfig = {
       profile: options.profile,
@@ -280,6 +296,8 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
       }
 
       let sawMessageStop = false;
+      let guardrailIntervened = false;
+      let guardrailTraceSummary: GuardrailTraceSummary | undefined;
       for await (const item of response.stream!) {
         if (item.messageStart) {
           if (item.messageStart.role !== ConversationRole.ASSISTANT) {
@@ -296,6 +314,8 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
           handleContentBlockStop(item.contentBlockStop, blocks, output, eventSink);
         } else if (item.messageStop) {
           sawMessageStop = true;
+          guardrailIntervened =
+            item.messageStop.stopReason === BedrockStopReason.GUARDRAIL_INTERVENED;
           if ((item.messageStop.stopReason as string | undefined) === "refusal") {
             applyAnthropicRefusal(
               output,
@@ -303,7 +323,14 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
               model.provider,
             );
           } else {
-            const mappedStop = mapStopReason(item.messageStop.stopReason);
+            const hasVisibleText = blocks.some(
+              (block) => block.type === "text" && block.text.trim().length > 0,
+            );
+            const mappedStop = mapStopReason(
+              item.messageStop.stopReason,
+              hasVisibleText,
+              guardrailStreamMode,
+            );
             output.stopReason = mappedStop.stopReason;
             if (mappedStop.errorMessage) {
               output.errorMessage = mappedStop.errorMessage;
@@ -311,6 +338,7 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
           }
         } else if (item.metadata) {
           handleMetadata(item.metadata, model, output);
+          guardrailTraceSummary = summarizeGuardrailTrace(item.metadata);
         } else if (item.internalServerException) {
           throw item.internalServerException;
         } else if (item.modelStreamErrorException) {
@@ -324,7 +352,20 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
         }
       }
 
-      if (refusalBuffer && !sawMessageStop) {
+      if (guardrailIntervened) {
+        log.warn(
+          "Bedrock guardrail intervened",
+          guardrailTraceSummary ?? {
+            tracePresent: false,
+            actionReasonPresent: false,
+            modelOutputCount: 0,
+            inputAssessmentCount: 0,
+            outputAssessmentCount: 0,
+          },
+        );
+      }
+
+      if (deferredBuffer && !sawMessageStop) {
         throw new Error("Bedrock stream ended before messageStop");
       }
       if (options.signal?.aborted) {
@@ -335,7 +376,7 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
         throw new Error(output.errorMessage ?? "An unknown error occurred");
       }
 
-      refusalBuffer?.flush();
+      deferredBuffer?.flush();
       stream.push({ type: "done", reason: output.stopReason, message: output });
       stream.end();
     } catch (error) {
@@ -344,8 +385,8 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
         // partialJson is only a streaming scratch buffer; never persist it.
         delete (block as Block).partialJson;
       }
-      if (refusalBuffer) {
-        refusalBuffer.discard();
+      if (deferredBuffer) {
+        deferredBuffer.discard();
         output.content = [];
       }
       output.stopReason = options.signal?.aborted ? "aborted" : "error";
@@ -575,6 +616,25 @@ function handleMetadata(
     output.usage.totalTokens = event.usage.totalTokens || output.usage.input + output.usage.output;
     calculateCost(model, output.usage);
   }
+}
+
+function summarizeGuardrailTrace(
+  event: ConverseStreamMetadataEvent,
+): GuardrailTraceSummary | undefined {
+  const guardrail = event.trace?.guardrail;
+  if (!guardrail) {
+    return undefined;
+  }
+  return {
+    tracePresent: true,
+    actionReasonPresent: Boolean(guardrail.actionReason),
+    modelOutputCount: guardrail.modelOutput?.length ?? 0,
+    inputAssessmentCount: Object.keys(guardrail.inputAssessment ?? {}).length,
+    outputAssessmentCount: Object.values(guardrail.outputAssessments ?? {}).reduce(
+      (total, assessments) => total + assessments.length,
+      0,
+    ),
+  };
 }
 
 function handleContentBlockStop(
@@ -1006,7 +1066,11 @@ function convertToolConfig(
   return { tools: bedrockTools, toolChoice: bedrockToolChoice };
 }
 
-function mapStopReason(reason: string | undefined): {
+function mapStopReason(
+  reason: string | undefined,
+  hasVisibleText: boolean,
+  guardrailStreamMode: "sync" | "async" | undefined,
+): {
   stopReason: StopReason;
   errorMessage?: string;
 } {
@@ -1014,13 +1078,16 @@ function mapStopReason(reason: string | undefined): {
     case BedrockStopReason.END_TURN:
     case BedrockStopReason.STOP_SEQUENCE:
       return { stopReason: "stop" };
+    case BedrockStopReason.GUARDRAIL_INTERVENED:
+      return guardrailStreamMode !== "async" && hasVisibleText
+        ? { stopReason: "stop" }
+        : { stopReason: "error", errorMessage: reason };
     case BedrockStopReason.MAX_TOKENS:
     case BedrockStopReason.MODEL_CONTEXT_WINDOW_EXCEEDED:
       return { stopReason: "length" };
     case BedrockStopReason.TOOL_USE:
       return { stopReason: "toolUse" };
     case BedrockStopReason.CONTENT_FILTERED:
-    case BedrockStopReason.GUARDRAIL_INTERVENED:
     case BedrockStopReason.MALFORMED_MODEL_OUTPUT:
     case BedrockStopReason.MALFORMED_TOOL_USE:
       return { stopReason: "error", errorMessage: reason };
@@ -1201,6 +1268,7 @@ const testing = {
   mapThinkingLevelToEffort,
   resolveSimpleBedrockOptions,
   shouldUseExplicitBedrockEndpoint,
+  summarizeGuardrailTrace,
 };
 
 if (process.env.VITEST === "true") {

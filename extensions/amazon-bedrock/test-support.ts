@@ -18,6 +18,15 @@ type BedrockStreamTestApi = {
     options: Record<string, unknown>,
   ) => Record<string, unknown>;
   shouldUseExplicitBedrockEndpoint: (...args: unknown[]) => boolean;
+  summarizeGuardrailTrace: (event: unknown) =>
+    | {
+        tracePresent: boolean;
+        actionReasonPresent: boolean;
+        modelOutputCount: number;
+        inputAssessmentCount: number;
+        outputAssessmentCount: number;
+      }
+    | undefined;
 };
 
 function requireTestApi(key: string): object {

@@ -11,7 +11,7 @@ import {
 } from "openclaw/plugin-sdk/plugin-test-runtime";
 import { withEnvAsync } from "openclaw/plugin-sdk/test-env";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { supportsBedrockPromptCaching } from "./bedrock-options.js";
+import { BEDROCK_GUARDRAIL_STREAM_MODE, supportsBedrockPromptCaching } from "./bedrock-options.js";
 import { resetBedrockDiscoveryCacheForTest } from "./discovery.js";
 import amazonBedrockPlugin from "./index.js";
 
@@ -988,6 +988,7 @@ describe("amazon-bedrock provider plugin", () => {
           trace: "enabled",
         },
       });
+      expect(Reflect.get(result, BEDROCK_GUARDRAIL_STREAM_MODE)).toBe("sync");
     });
 
     it("injects only required fields when optional fields are omitted", async () => {
@@ -1005,6 +1006,20 @@ describe("amazon-bedrock provider plugin", () => {
           guardrailVersion: "DRAFT",
         },
       });
+      expect(Reflect.get(result, BEDROCK_GUARDRAIL_STREAM_MODE)).toBe("sync");
+    });
+
+    it("propagates async stream processing mode to the Bedrock runtime", async () => {
+      const provider = await registerWithConfig({
+        guardrail: {
+          guardrailIdentifier: "async-guardrail",
+          guardrailVersion: "1",
+          streamProcessingMode: "async",
+        },
+      });
+      const result = await callWrappedStream(provider, NON_ANTHROPIC_MODEL, MODEL_DESCRIPTOR);
+
+      expect(Reflect.get(result, BEDROCK_GUARDRAIL_STREAM_MODE)).toBe("async");
     });
 
     it("injects guardrailConfig for Anthropic models without cacheRetention: none", async () => {
